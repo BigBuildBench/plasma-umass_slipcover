@@ -1,0 +1,115 @@
+#
+# When executed manually, this will upload a ".devNNN" build to testpypi;
+# when executed upon a release, it will upload a regular build to pypi.
+#
+# For pypi, you need to have the PYPI_USERNAME and PYPI_PASSWORD secrets configured.
+# For testpypi, you'll need TESTPYPI_USERNAME and TESTPYPI_PASSWORD.
+#
+name: build & upload
+
+on:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+
+jobs:
+  pick-devN:
+    name: create .devN build date coordinated across all matrix jobs
+    runs-on: ubuntu-latest
+    steps:
+      - run: TZ='America/New_York' date '+%Y%m%d%H%M' > dev-build.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devN
+          path: dev-build.txt
+
+  build-wheel:
+    needs: pick-devN
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      matrix:
+        python_version: ['3.8', '3.9', '3.10']  # The 3.10 builds use abi3, so are good for Python 3.10+
+        os: ['ubuntu-latest', 'macos-13', 'macos-14', 'windows-latest']
+        include:
+          - os: ubuntu-latest
+            container: quay.io/pypa/manylinux_2_28_x86_64 # https://github.com/pypa/manylinux
+          # From 3.12 onwards we're a "pure Python" package;  also, only one needs to upload sources
+          - python_version: 3.12
+            os: ubuntu-latest
+            container: ''
+            upload_source: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        # needed for container and self-hosted runners; see https://github.com/actions/checkout/issues/766
+        if: matrix.container != ''
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # setuptool's bdist uses 'git archive' to find files, and fails silently if it can't,
+          # leading to missing files in the archive.  Run it separately to force a failure in that case.
+          (cd src; git archive --prefix slipcover/ HEAD | tar -t > /dev/null)
+
+      - name: get coordinated .devN
+        if: github.event_name != 'release'
+        uses: actions/download-artifact@v4
+        with:
+          name: devN
+
+      - name: select Xcode version
+        # MacOS > 14.2 requires Xcode >= 15.3; otherwise loading native extension modules fails with e.g.:
+        # dlopen(/opt/homebrew/lib/python3.11/site-packages/slipcover/probe.abi3.so, 0x0002): bad bind opcode 0x00 
+        if: startsWith(matrix.os, 'macos-')
+        run: |
+          if [ -d /Applications/Xcode_15.3.app/Contents/Developer ]; then sudo xcode-select --switch /Applications/Xcode_15.3.app/Contents/Developer; fi
+          clang++ --version
+          g++ --version
+
+      - name: set up python (script version)
+        if: matrix.container == ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_version }}
+
+      - name: set up python (container version)
+        if: matrix.container != ''
+        run: |
+          PYV=`echo "${{ matrix.python_version }}" | tr -d "."`; ls -d -1 /opt/python/cp$PYV*/bin | head -n 1 >> $GITHUB_PATH
+          cat $GITHUB_PATH
+
+      - name: install dependencies
+        run: |
+          python3 -m pip install -U pip # avoids GitHub warnings
+          python3 -m pip install twine build
+
+      - name: build wheel
+        run: python3 -m build --wheel
+
+      - name: run auditwheel for manylinux
+        if: matrix.container != ''
+        run: |
+          auditwheel repair dist/*.whl
+          rm -f dist/*.whl
+          mv wheelhouse/*.whl dist/
+
+      - name: build source dist
+        if: matrix.upload_source
+        run: python3 -m build --sdist
+
+      - name: Non-release (dev) upload
+        if: github.event_name != 'release'
+        env:
+          TWINE_REPOSITORY: testpypi
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TESTPYPI_TOKEN }}
+        run: twine upload --verbose dist/*
+
+      - name: Release upload
+        if: github.event_name == 'release'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: twine upload --verbose dist/*
